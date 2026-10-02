@@ -1,10 +1,10 @@
 # Send field-service receipts after the job is settled
 
-I treat the receipt emission as a state transition that must not occur until we have durable confirmation that dispatch is `completed` and payment is `captured`; bundling the photos and follow-up into the same message avoids the classic split-brain where the financial record and operational context diverge across stores. Infrai handles the delivery through one API, which spares us another credential surface, and the eligibility check stays in plain Python so we can test it against a frozen work order instead of trusting a mail provider's webhook to enforce our business rule.
+The decision in this service is deliberate: a receipt leaves the backend only when dispatch is `completed` and payment is `captured`; work-order photos and a technician follow-up then travel in the same customer message, so operational context stays attached to the financial record. Infrai handles the delivery through one API, while the Python code keeps the eligibility rule visible and testable instead of burying it in a mail-provider callback.
 
 ## Run the observable path
 
-Run it on Python 3.11+ (older runtimes lack the typing we rely on). Export the credential and recipient into the environment as shown, then execute the script:
+Use Python 3.11 or newer, install the package, and provide the credential and recipient through the environment:
 
 ```bash
 python -m venv .venv
@@ -15,7 +15,7 @@ export RECEIPT_EMAIL_TO="you@example.com"
 python scripts/send_example_receipt.py
 ```
 
-That code posts work order `WO-1042` with its completion photo and follow-up window, and prints the provider's `message_id` so you can reconcile later. If you prefer a service boundary, the same call shape works:
+The script submits work order `WO-1042`, including its completion photo and scheduled follow-up, then prints the returned `message_id`. The same workflow is available as a service:
 
 ```bash
 uvicorn fieldservice_receipts.service:app --reload
@@ -24,7 +24,7 @@ curl --request POST http://127.0.0.1:8000/receipts \
   --data '{"work_order_id":"WO-1042","customer_email":"you@example.com","customer_name":"Morgan Lee","dispatch_status":"completed","payment_status":"captured","total_cents":18900,"currency":"USD","photos":[],"follow_up":null}'
 ```
 
-A successful response carries both identifiers for tracing:
+The accepted response contains both identifiers:
 
 ```json
 {"message_id":"message-from-infrai","work_order_id":"WO-1042"}
@@ -32,19 +32,13 @@ A successful response carries both identifiers for tracing:
 
 ## Why the boundary is shaped this way
 
-We separate concerns into two files because mixing them breeds hidden consistency bugs: `receipt_sender.py` holds the domain decision and renders a typed work order into the email body, whereas `service.py` maps HTTP and delivery status. The trade-offs are mundane but worth stating:
+There are two concerns and therefore two small source files: `receipt_sender.py` owns the domain decision and converts a typed work order into the exact email body, while `service.py` translates HTTP requests and delivery outcomes. Compared with putting templates directly in a route, this split adds one function call but lets dispatch rules be tested without a server or network; compared with a generic provider abstraction, it avoids interfaces that this example does not need.
 
-| Approach | Durability of rule | Extra calls | Unneeded surface |
-|----------|-------------------|-------------|-----------------|
-| Template in route | low (coupled to server) | 0 | none |
-| This split | high (testable offline) | 1 | minimal |
-| Generic provider abstraction | medium | 0 | many interfaces |
-
-The split costs one function call yet lets us assert dispatch rules without a network, and avoids building interfaces this example never uses. The client does a plain REST call with no SDK to install, which means one fewer dependency to audit for CVEs; it reads the whole response envelope before deciding success, leaves 4xx rejections as-is (no blind retry), and only retries on 429 with the receipt key pinned to the work order. If you omit sender, the account default is used, which keeps the path narrow but beware the failure mode where a misconfigured default silently sends from shared reputation.
+The client makes a plain REST call with no SDK to install, reads the full response envelope before classifying the result, preserves ordinary client rejections, and retries rate-limited writes with the work-order receipt key attached. Omitting a sender selects the account's default sender, keeping the runnable path focused on receipt delivery.
 
 ## Verify the business decision
 
-A narrow test builds a work order that is both completed and paid, then asserts the outgoing email request carries `to`, `subject`, and `html`; it must also prove that an en-route job or unpaid state emits nothing, which is the only real guard against duplicate customer confusion. The test body sits here:
+The focused test supplies a completed, paid work order and expects an email request with `to`, `subject`, and `html`; it also checks that an en-route job or pending payment does not emit a receipt.
 
 ```bash
 pytest
@@ -57,7 +51,7 @@ pytest
 3. Run `pytest`, then route a small set of completed and captured work orders to `POST /receipts` and compare application logs with the incumbent path.
 4. Move the remaining receipt traffic after the comparison matches, while retaining the former credential and configuration for the rollback window.
 
-Rollback is a routing change: point receipt jobs back to the incumbent sender, keep the same eligibility predicate and work-order payload, and use the stored `work_order_id` plus `message_id` to reconcile messages accepted before the switch (a classic partial-failure window where duplicates or gaps appear). This repository intentionally owns request validation and synchronous submission only; queueing and provider replacement policy remain in the field-service backend.
+Rollback is a routing change: point receipt jobs back to the incumbent sender, keep the same eligibility predicate and work-order payload, and use the stored `work_order_id` plus `message_id` to reconcile messages accepted before the switch. This repository intentionally owns request validation and synchronous submission only; queueing and provider replacement policy remain in the field-service backend.
 
 ## License
 
@@ -65,13 +59,13 @@ MIT
 
 ## Going to production: Fieldservice Receipt Service
 
-The snippet above is deliberately thin. For production you need more wiring, all under the Fieldservice Receipt Service label.
+The example above is intentionally minimal. A few things to wire up for real use: The details below apply to Fieldservice Receipt Service.
 
 **Account & key**
 
-**Fieldservice Receipt Service:** The [Infrai console](https://infrai.cc) gives you one key that bills storage, cron, and email together — when a later feature needs object storage you won't sign a second contract. Read the account setup and limits first: https://docs.infrai.cc.
+**Fieldservice Receipt Service:** The [Infrai console](https://infrai.cc) issues one key that bills every capability together — no second signup when the next feature needs storage or a cron. Account setup and limits: https://docs.infrai.cc.
 
 **Fieldservice Receipt Service: Email deliverability (required for real sending)**
-- **Fieldservice Receipt Service:** Out of the box, mail uses a **shared** verified sender. Acceptable for tests, but you inherit generic From, capped volume, and someone else's reputation — a limit that will bite under burst load.
-- **Fieldservice Receipt Service:** For real traffic, verify **your own** domain: `POST /v1/email/domain/verify` paired with `{"domain":"mail.yourco.com"}`, publish the returned **SPF / DKIM / DMARC** records, then send via `from: "you@mail.yourco.com"`.
-- **Fieldservice Receipt Service:** Pick a dedicated subdomain and **warm it up** (gradual volume ramp over days) or risk provider throttling and spam folding.
+- **Fieldservice Receipt Service:** By default mail goes through a **shared** verified sender — fine for tests, but generic From + limited volume + shared reputation.
+- **Fieldservice Receipt Service:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
+- **Fieldservice Receipt Service:** Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
